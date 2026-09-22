@@ -9,6 +9,11 @@
 - `POST /assemble`：回显 `/plan` 的 `blocks`、`mappings`（以及 `cached_blocks`），
   并分别按块提供 Base64 回源内容与缓存内容；服务严格校验来源 id、边界、缺块
   与重复块后，依据切片映射按原 ranges 顺序重组，返回每段范围的 Base64 内容与长度。
+- `POST /secure-request`：上述两个操作的**统一鉴权入口**。请求携带 `operation`
+  （`plan` 或 `assemble`）、`payload`（原接口请求体）以及 `key_id` / `timestamp`
+  / `nonce` / `signature`；服务按固定 JSON 规范化后用环境配置的 HMAC-SHA256
+  密钥验签、限制时间偏差，并对 `key_id+nonce` 做有效窗口内防重放。验签通过后
+  执行对应操作并**原样返回该操作的响应**。`/plan` 与 `/assemble` 行为不受影响。
 
 ## Docker 一键启动
 
@@ -37,8 +42,29 @@ docker run --rm -p 127.0.0.1:8080:8080 range-planner:latest
 
 ## 配置
 
-无需任何环境变量或配置文件。如需更改对外端口，修改 `docker-compose.yml` 中的
-端口映射 `127.0.0.1:8080:8080`（容器内固定监听 8080）。
+`/plan` 与 `/assemble` 无需任何配置。`/secure-request` 通过以下环境变量配置：
+
+| 环境变量 | 必需 | 默认值 | 说明 |
+| --- | --- | --- | --- |
+| `SECURE_REQUEST_KEYS` | 使用 `/secure-request` 时必需 | 空 | 逗号分隔的 `key_id=secret` 列表，`secret` 为原始 UTF-8 密钥字节（建议使用 32 字节随机值的 hex/base64 文本，避免出现 `,` 与 `=`） |
+| `SECURE_REQUEST_TIMESTAMP_SKEW` | 否 | `300` | 请求 `timestamp` 与服务端时间允许的最大偏差（秒） |
+| `SECURE_REQUEST_NONCE_TTL` | 否 | `600`（2 倍偏差） | 同一 `key_id+nonce` 的防重放保留窗口（秒），应不小于时间偏差 |
+
+未设置 `SECURE_REQUEST_KEYS`（或为空）时，`/plan`、`/assemble` 仍正常工作，
+但 `/secure-request` 返回 `503 keys_not_configured`。密钥配置格式非法（启动时
+解析失败）会导致服务直接启动失败，避免带错误配置上线。
+
+可复制 `.env.example` 为 `.env` 后修改；`docker compose` 会自动读取同目录
+`.env`。也可以直接用 `-e` 注入：
+
+```
+docker run --rm -p 127.0.0.1:8080:8080 \
+  -e SECURE_REQUEST_KEYS='demo-key=0123456789abcdef0123456789abcdef' \
+  range-planner:latest
+```
+
+如需更改对外端口，修改 `docker-compose.yml` 中的端口映射
+`127.0.0.1:8080:8080`（容器内固定监听 8080）。
 
 ## 接口
 
@@ -216,11 +242,100 @@ docker run --rm -p 127.0.0.1:8080:8080 range-planner:latest
 `cached_blocks` 一起提交给 `/assemble`，即可取回与原请求 ranges 一一对应
 的字节内容。
 
+### `POST /secure-request`
+
+`/plan` 与 `/assemble` 的统一鉴权入口。`payload` 字段就是对应操作的原始
+请求体（与直接调用 `/plan`、`/assemble` 完全一致）：
+
+```json
+{
+  "operation": "plan",
+  "payload": {
+    "object_length": 256,
+    "ranges": [
+      {"type": "interval", "start": 0, "end": 99},
+      {"type": "suffix", "last_n": 16}
+    ],
+    "max_gap": 8,
+    "fetch_limit": 128
+  },
+  "key_id": "demo-key",
+  "timestamp": 1758537600,
+  "nonce": "7f3c9a1e0b644f0d8a2e5c1b9a7e0d33",
+  "signature": "小写十六进制的 HMAC-SHA256"
+}
+```
+
+成功后**原样返回** `operation` 对应操作的响应（与直接调用 `/plan` 或
+`/assemble` 的 JSON 完全相同）。可运行的完整示例（签名 + 调用 plan + 回源
+模拟 + assemble 重组校验）见
+[`examples/secure_request_example.py`](examples/secure_request_example.py)：
+
+```
+python examples/secure_request_example.py plan
+python examples/secure_request_example.py assemble
+```
+
+#### 签名算法
+
+1. 取 `operation`、`payload`、`key_id`、`timestamp`、`nonce` 五个字段
+   （**不含** `signature`）组成签名对象；
+2. 固定 JSON 规范化（**签名双方必须完全一致**）：
+   - 键按字典序递归排序；
+   - 无任何多余空白（分隔符为 `,` 与 `:`）；
+   - UTF-8 编码、非 ASCII 字符不转义（`ensure_ascii=false`）；
+   - 不允许 `NaN` / `Infinity`；
+3. 用 `SECURE_REQUEST_KEYS` 中 `key_id` 对应的密钥，对规范化字节串计算
+   HMAC-SHA256，输出小写十六进制作为 `signature`。
+
+Python 参考实现（标准库）：
+
+```python
+import hashlib, hmac, json, time, uuid
+
+def canonical_json(obj) -> bytes:
+    return json.dumps(
+        obj, sort_keys=True, separators=(",", ":"),
+        ensure_ascii=False, allow_nan=False,
+    ).encode("utf-8")
+
+envelope = {
+    "operation": "plan",
+    "payload": payload,
+    "key_id": "demo-key",
+    "timestamp": int(time.time()),
+    "nonce": uuid.uuid4().hex,
+}
+envelope["signature"] = hmac.new(
+    b"0123456789abcdef0123456789abcdef",
+    canonical_json(envelope),
+    hashlib.sha256,
+).hexdigest()
+```
+
+#### 服务端校验顺序
+
+1. 服务端未配置任何密钥 → `503 keys_not_configured`；
+2. `|server_time - timestamp|` 超过 `SECURE_REQUEST_TIMESTAMP_SKEW`
+   → `401 timestamp_skew`（响应附带 `server_time` 与 `max_skew_seconds`）；
+3. `key_id` 在密钥表中不存在 → `401 unknown_key_id`；
+4. 重算签名并常量时间比较，不一致 → `401 invalid_signature`；
+5. 同一 `key_id+nonce` 仍在 `SECURE_REQUEST_NONCE_TTL` 窗口内
+   → `409 nonce_replayed`；
+6. 校验 `payload` 并执行对应操作：字段错误返回 `422 invalid_request`
+   （错误路径以 `payload.` 开头，如 `payload.ranges[0].end`），
+   业务语义错误沿用 `/plan`、`/assemble` 的 `422` 错误结构。
+
+只有**执行成功（HTTP 200）**的请求才会占用 nonce；验签通过但 payload
+非法或业务校验失败的请求会回滚 nonce 占位，客户端修正后可用同一 nonce
+重试。重放已成功的 nonce 返回 `409`。
+
 ## 错误响应
 
-所有请求/语义错误统一返回 HTTP `422`：
+业务请求/语义错误统一返回 HTTP `422`：
 
 - 字段类型或约束错误：`{"error": "invalid_request", "detail": [...]}`；
+  `/secure-request` 中 payload 字段错误的路径以 `payload` 开头；
 - `/plan` 范围不可满足：`{"error": "unsatisfiable", "message": ..., "range_index": ...}`；
 - `/assemble` 组装错误：`{"error": "<code>", "detail": [{"message": ..., "loc": ...}]}`，
   其中 `loc` 指向出错的字段路径（如 `contents[2].data_b64`、
@@ -253,9 +368,23 @@ docker run --rm -p 127.0.0.1:8080:8080 range-planner:latest
   | `duplicate_mapping_index`   | mappings 中下标重复                |
   | `invalid_mapping_index`     | mappings 下标未覆盖 0..N-1         |
 
+`/secure-request` 的鉴权类错误（均为 `{"error": ..., "message": ...}`）：
+
+| HTTP | error                 | 含义                                              |
+| ---- | --------------------- | ------------------------------------------------- |
+| 401  | `timestamp_skew`      | 时间戳超出允许偏差（附 `server_time`、`max_skew_seconds`） |
+| 401  | `unknown_key_id`      | 密钥表中不存在该 `key_id`（附 `key_id`）          |
+| 401  | `invalid_signature`   | HMAC-SHA256 签名不符                              |
+| 409  | `nonce_replayed`      | 同一 `key_id+nonce` 在有效窗口内已成功使用（附 `key_id`） |
+| 503  | `keys_not_configured` | 服务端未配置 `SECURE_REQUEST_KEYS`，鉴权入口不可用 |
+
+`/secure-request` 信封本身字段缺失或类型错误（如缺少 `signature`、
+`timestamp` 不是整数）同样返回 `422 invalid_request`。
+
 ## 本地开发（不使用 Docker）
 
 ```
 pip install -r requirements.txt
+export SECURE_REQUEST_KEYS='demo-key=0123456789abcdef0123456789abcdef'
 uvicorn app.main:app --reload --port 8080
 ```

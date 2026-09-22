@@ -12,6 +12,12 @@ POST /assemble 回显 /plan 的 blocks、mappings（以及 cached_blocks），�
 分别按块提供 Base64 回源内容与缓存内容；服务严格校验来源 id、边界、缺块
 与重复块后，依据切片映射按原 ranges 顺序重组，返回每段范围的 Base64
 内容与长度。
+
+POST /secure-request 是 /plan 与 /assemble 的统一鉴权入口：请求携带
+operation（plan 或 assemble）、payload（即原接口请求体）、key_id、
+timestamp、nonce、signature；服务按固定 JSON 规范化后用环境配置的
+HMAC-SHA256 密钥验签，限制时间偏差，并对 key_id+nonce 做窗口内防重放。
+验签通过后执行对应操作并原样返回其响应；/plan 与 /assemble 本身不受影响。
 """
 
 from __future__ import annotations
@@ -19,18 +25,84 @@ from __future__ import annotations
 import base64
 import binascii
 import bisect
-from typing import Annotated, Literal, Union
+import hashlib
+import hmac
+import json
+import os
+import threading
+import time
+from typing import Annotated, Any, Literal, Union
 
 from fastapi import FastAPI, Request
 from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, BeforeValidator, Field, StrictInt, model_validator
+from pydantic import (
+    BaseModel,
+    BeforeValidator,
+    Field,
+    StrictInt,
+    ValidationError,
+    model_validator,
+)
 
 app = FastAPI(
     title="Range 回源规划服务",
     description="为对象存储代理规划可合并、带上限、可感知缓存的 HTTP Range 回源。",
 )
+
+
+# ---------------------- /secure-request 鉴权配置 ----------------------
+
+
+class SecureRequestConfig:
+    """从环境变量加载的 HMAC 验签配置（进程级单例）。
+
+    - SECURE_REQUEST_KEYS：逗号分隔的 ``key_id=secret`` 列表，secret 为
+      原始 UTF-8 密钥字节（如含特殊字符建议用仅含字母数字/base64 字符的密钥）。
+    - SECURE_REQUEST_TIMESTAMP_SKEW：允许的时间偏差（秒），默认 300。
+    - SECURE_REQUEST_NONCE_TTL：nonce 保留时长（秒），默认取 2 倍偏差。
+    """
+
+    def __init__(self) -> None:
+        self.keys: dict[str, bytes] = {}
+        self.raw = os.environ.get("SECURE_REQUEST_KEYS", "")
+        for item in self.raw.split(","):
+            item = item.strip()
+            if not item:
+                continue
+            key_id, sep, secret = item.partition("=")
+            if not sep or not key_id or not secret:
+                raise RuntimeError(
+                    "SECURE_REQUEST_KEYS 格式非法：每项必须为非空的 'key_id=secret'"
+                )
+            self.keys[key_id] = secret.encode("utf-8")
+
+        skew = int(os.environ.get("SECURE_REQUEST_TIMESTAMP_SKEW", "300"))
+        if skew < 1:
+            raise RuntimeError("SECURE_REQUEST_TIMESTAMP_SKEW 必须为正整数")
+        self.timestamp_skew = skew
+
+        nonce_ttl = int(
+            os.environ.get("SECURE_REQUEST_NONCE_TTL", str(max(1, 2 * skew)))
+        )
+        if nonce_ttl < 1:
+            raise RuntimeError("SECURE_REQUEST_NONCE_TTL 必须为正整数")
+        self.nonce_ttl = nonce_ttl
+
+
+secure_config = SecureRequestConfig()
+
+# 进程内 nonce 防重放存储：(key_id, nonce) -> 成功/占用的到期时间戳。
+_nonce_lock = threading.Lock()
+_nonce_seen: dict[tuple[str, str], float] = {}
+
+
+def _sweep_nonces(now: float) -> None:
+    """清理已过期 nonce（调用方需持有 _nonce_lock）。"""
+    expired = [k for k, expiry in _nonce_seen.items() if expiry <= now]
+    for k in expired:
+        del _nonce_seen[k]
 
 
 # ----------------------------- 公共类型 -----------------------------
@@ -186,6 +258,30 @@ class AssembleResponse(BaseModel):
     object_length: int
     ranges: list[AssembledRange] = Field(
         ..., description="按原 ranges 顺序（mappings[].index）排列的重组结果"
+    )
+
+
+# ---------------------- /secure-request 请求模型 ----------------------
+
+
+class SecureRequest(BaseModel):
+    """/secure-request 的签名信封；payload 为 /plan 或 /assemble 的原请求体。"""
+
+    operation: Literal["plan", "assemble"] = Field(
+        ..., description="要执行的操作：plan 或 assemble"
+    )
+    payload: dict[str, Any] = Field(
+        ..., description="对应操作的原始请求体（/plan 或 /assemble 的 JSON）"
+    )
+    key_id: str = Field(..., min_length=1, max_length=128, description="密钥 id")
+    timestamp: Annotated[int, StrictInt] = Field(
+        ..., ge=0, description="Unix 秒级时间戳"
+    )
+    nonce: str = Field(
+        ..., min_length=1, max_length=128, description="一次性随机串，防重放"
+    )
+    signature: str = Field(
+        ..., min_length=1, description="规范化签名串的 HMAC-SHA256（小写十六进制）"
     )
 
 
@@ -986,3 +1082,161 @@ def assemble(req: AssembleRequest) -> AssembleResponse:
         )
 
     return AssembleResponse(object_length=req.object_length, ranges=results)
+
+
+# ----------------------------- /secure-request -----------------------------
+
+
+def canonical_signing_object(
+    operation: str,
+    payload: dict[str, Any],
+    key_id: str,
+    timestamp: int,
+    nonce: str,
+) -> dict[str, Any]:
+    """构造固定字段集合的签名对象（不含 signature 本身）。"""
+    return {
+        "operation": operation,
+        "payload": payload,
+        "key_id": key_id,
+        "timestamp": timestamp,
+        "nonce": nonce,
+    }
+
+
+def canonical_json(obj: Any) -> bytes:
+    """固定 JSON 规范化：键按字典序排序、无多余空白、UTF-8、ensure_ascii=False。
+
+    签名双方必须使用完全一致的规范化结果。不支持 NaN/Infinity
+    （Python 的 json 默认 allow_nan 会输出非标准 JSON，这里显式拒绝）。
+    """
+    return json.dumps(
+        obj,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        allow_nan=False,
+    ).encode("utf-8")
+
+
+def _auth_error(
+    code: str, message: str, *, status_code: int, **extra: Any
+) -> JSONResponse:
+    """构造可定位的 401/409/503 鉴权错误响应。"""
+    return JSONResponse(
+        status_code=status_code,
+        content={"error": code, "message": message, **extra},
+    )
+
+
+@app.post("/secure-request")
+def secure_request(raw: SecureRequest) -> JSONResponse:
+    """统一鉴权入口：验签 + 时间窗 + nonce 防重放后执行 plan/assemble。
+
+    成功时原样返回对应操作的响应（HTTP 200）。鉴权失败返回 401，
+    nonce 重放返回 409，payload 语义错误沿用对应操作的 422 结构。
+    """
+    # 0. 服务端未配置任何密钥：明确报错，而不是静默放行。
+    if not secure_config.keys:
+        return _auth_error(
+            "keys_not_configured",
+            "服务端未配置 SECURE_REQUEST_KEYS，/secure-request 不可用",
+            status_code=503,
+        )
+
+    # 1. 时间偏差校验（先于密钥查找/验签，过期请求一律拒绝）。
+    now = time.time()
+    skew = now - raw.timestamp
+    if abs(skew) > secure_config.timestamp_skew:
+        return _auth_error(
+            "timestamp_skew",
+            f"时间戳偏差 {skew:+.0f}s 超出允许范围 "
+            f"±{secure_config.timestamp_skew}s",
+            status_code=401,
+            server_time=int(now),
+            max_skew_seconds=secure_config.timestamp_skew,
+        )
+
+    # 2. key_id 未知：明确报错（不与签名失败混淆，便于客户端定位）。
+    secret = secure_config.keys.get(raw.key_id)
+    if secret is None:
+        return _auth_error(
+            "unknown_key_id",
+            f"未知的 key_id：{raw.key_id!r}",
+            status_code=401,
+            key_id=raw.key_id,
+        )
+
+    # 3. 固定 JSON 规范化后重算 HMAC-SHA256，常量时间比较。
+    try:
+        signing_bytes = canonical_json(
+            canonical_signing_object(
+                raw.operation, raw.payload, raw.key_id, raw.timestamp, raw.nonce
+            )
+        )
+    except (TypeError, ValueError):
+        return _auth_error(
+            "invalid_signing_payload",
+            "payload 无法规范化为 JSON（包含 NaN/Infinity 或不可序列化值）",
+            status_code=422,
+        )
+    expected = hmac.new(secret, signing_bytes, hashlib.sha256).hexdigest()
+    if not hmac.compare_digest(expected, raw.signature.lower()):
+        return _auth_error(
+            "invalid_signature",
+            "签名校验失败：signature 与规范化签名串的 HMAC-SHA256 不符",
+            status_code=401,
+        )
+
+    # 4. nonce 防重放：同一 key_id+nonce 在有效窗口内只能成功一次。
+    #    先占位；若后续 payload 校验或操作执行失败则回滚，避免失败请求
+    #    白白消耗 nonce（只有真正成功的请求才永久占用）。
+    nonce_key = (raw.key_id, raw.nonce)
+    with _nonce_lock:
+        _sweep_nonces(now)
+        if nonce_key in _nonce_seen:
+            return _auth_error(
+                "nonce_replayed",
+                f"key_id={raw.key_id!r} 的 nonce 已在有效窗口内使用过",
+                status_code=409,
+                key_id=raw.key_id,
+            )
+        _nonce_seen[nonce_key] = now + secure_config.nonce_ttl
+
+    try:
+        # 5. 鉴权通过：用 payload 校验对应操作的模型（失败返回带 payload
+        #    路径的 422），再执行原有逻辑并原样序列化其响应。
+        try:
+            if raw.operation == "plan":
+                result = plan(PlanRequest.model_validate(raw.payload))
+            else:
+                result = assemble(AssembleRequest.model_validate(raw.payload))
+        except ValidationError as exc:
+            errors = exc.errors()
+            for err in errors:
+                err["loc"] = ("payload",) + tuple(err.get("loc", ()))
+            response = JSONResponse(
+                status_code=422,
+                content={
+                    "error": "invalid_request",
+                    "detail": jsonable_encoder(
+                        errors, custom_encoder={Exception: str}
+                    ),
+                },
+            )
+        else:
+            response = JSONResponse(
+                status_code=200, content=jsonable_encoder(result)
+            )
+    except BaseException:
+        # 业务异常（PlanningError/AssemblyError 等 422）或其他异常：
+        # 本次请求未成功，释放 nonce 占位，允许客户端修正后用同一 nonce 重试。
+        with _nonce_lock:
+            _nonce_seen.pop(nonce_key, None)
+        raise
+
+    # payload 校验失败（未执行任何操作）：同样回滚 nonce 占位。
+    if response.status_code != 200:
+        with _nonce_lock:
+            _nonce_seen.pop(nonce_key, None)
+    return response
