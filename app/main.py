@@ -19,17 +19,115 @@ from __future__ import annotations
 import base64
 import binascii
 import bisect
+import hashlib
+import hmac
+import json
+import logging
+import os
+import threading
+import time
+from contextlib import asynccontextmanager
 from typing import Annotated, Literal, Union
 
 from fastapi import FastAPI, Request
 from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, BeforeValidator, Field, StrictInt, model_validator
+from pydantic import BaseModel, BeforeValidator, Field, StrictInt, ValidationError, model_validator
+
+logger = logging.getLogger("range_planner.security")
+
+
+# ---------------------- /secure-request 安全配置 ----------------------
+
+DEFAULT_TIMESTAMP_TOLERANCE = 300  # 秒；允许的客户端/服务端时钟偏差
+MAX_NONCE_LENGTH = 128
+
+SECURE_ENV_KEYS = "SECURE_REQUEST_KEYS"
+SECURE_ENV_TOLERANCE = "SECURE_REQUEST_TIMESTAMP_TOLERANCE"
+
+
+def _load_secure_keys() -> tuple[dict[str, bytes], str | None]:
+    """从环境变量加载 key_id -> HMAC-SHA256 密钥。
+
+    SECURE_REQUEST_KEYS 为 JSON 对象：{"key_id": "<标准 Base64 密钥>"}。
+    返回 (密钥表, 配置错误信息)；未配置或配置非法时密钥表为空。
+    """
+    raw = os.environ.get(SECURE_ENV_KEYS, "").strip()
+    if not raw:
+        return {}, None
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        return {}, f"{SECURE_ENV_KEYS} 不是合法 JSON：{exc}"
+    if not isinstance(parsed, dict) or not parsed:
+        return {}, f"{SECURE_ENV_KEYS} 必须是非空的 key_id -> Base64 密钥 JSON 对象"
+
+    keys: dict[str, bytes] = {}
+    for key_id, secret_b64 in parsed.items():
+        if not isinstance(key_id, str) or not key_id:
+            return {}, f"{SECURE_ENV_KEYS} 中的 key_id 必须是非空字符串"
+        if not isinstance(secret_b64, str):
+            return {}, f"key_id {key_id!r} 的密钥必须是 Base64 字符串"
+        try:
+            secret = base64.b64decode(secret_b64, validate=True)
+        except (binascii.Error, ValueError) as exc:
+            return {}, f"key_id {key_id!r} 的密钥不是合法的标准 Base64：{exc}"
+        if not secret:
+            return {}, f"key_id {key_id!r} 的密钥不能为空"
+        keys[key_id] = secret
+    return keys, None
+
+
+def _load_timestamp_tolerance() -> int:
+    raw = os.environ.get(SECURE_ENV_TOLERANCE, "").strip()
+    if not raw:
+        return DEFAULT_TIMESTAMP_TOLERANCE
+    try:
+        value = int(raw)
+    except ValueError:
+        logger.warning(
+            "%s=%r 不是整数，回退默认值 %d 秒",
+            SECURE_ENV_TOLERANCE,
+            raw,
+            DEFAULT_TIMESTAMP_TOLERANCE,
+        )
+        return DEFAULT_TIMESTAMP_TOLERANCE
+    if value < 1:
+        logger.warning(
+            "%s 必须 >= 1 秒，回退默认值 %d 秒",
+            SECURE_ENV_TOLERANCE,
+            DEFAULT_TIMESTAMP_TOLERANCE,
+        )
+        return DEFAULT_TIMESTAMP_TOLERANCE
+    return value
+
+
+SECURE_KEYS, SECURE_KEYS_ERROR = _load_secure_keys()
+TIMESTAMP_TOLERANCE = _load_timestamp_tolerance()
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    if SECURE_KEYS:
+        logger.info(
+            "/secure-request 已启用：配置了 %d 个 key_id，时间戳容限 %d 秒",
+            len(SECURE_KEYS),
+            TIMESTAMP_TOLERANCE,
+        )
+    else:
+        logger.warning(
+            "/secure-request 不可用：未配置 %s（%s），请求将返回 503",
+            SECURE_ENV_KEYS,
+            SECURE_KEYS_ERROR or "环境变量为空",
+        )
+    yield
+
 
 app = FastAPI(
     title="Range 回源规划服务",
     description="为对象存储代理规划可合并、带上限、可感知缓存的 HTTP Range 回源。",
+    lifespan=lifespan,
 )
 
 
@@ -986,3 +1084,242 @@ def assemble(req: AssembleRequest) -> AssembleResponse:
         )
 
     return AssembleResponse(object_length=req.object_length, ranges=results)
+
+
+# ----------------------------- /secure-request -----------------------------
+
+
+class NonceStore:
+    """进程内 (key_id, nonce) 防重放记录。
+
+    每个成功验签的 nonce 保留到其可重放窗口结束（客户端 timestamp +
+    容限），窗口内同一 key_id + nonce 只能成功一次。定期顺带清除过期项。
+    注意：记录仅保存在单个进程内存中，多进程/多副本部署需改用共享存储。
+    """
+
+    def __init__(self) -> None:
+        self._seen: dict[tuple[str, str], int] = {}
+        self._lock = threading.Lock()
+
+    def reserve(self, key_id: str, nonce: str, expires_at: int) -> bool:
+        """原子地登记 nonce；尚未记录返回 True（允许本次请求），否则 False。"""
+        key = (key_id, nonce)
+        now = time.time()
+        with self._lock:
+            # 顺带清除已过可重放窗口的记录
+            expired = [k for k, exp in self._seen.items() if exp <= now]
+            for k in expired:
+                del self._seen[k]
+            if key in self._seen:
+                return False
+            self._seen[key] = expires_at
+            return True
+
+
+nonce_store = NonceStore()
+
+
+def canonical_json(value: object) -> bytes:
+    """固定 JSON 规范化：按 key 排序、紧凑分隔符、不转义非 ASCII 字符。
+
+    签名双方必须使用完全相同的规范化规则。object 的 key 按 Unicode
+    码位字典序排列；签名上下文中的时间戳以整数写入，调用方应使用整数
+    Unix 秒，避免不同语言浮点表示差异。
+    """
+    return json.dumps(
+        value,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        allow_nan=False,
+    ).encode("utf-8")
+
+
+def build_signing_document(
+    payload: object, key_id: str, timestamp: int, nonce: str
+) -> bytes:
+    """构造待签名内容：规范化后的信封（payload 在内）与 operation 无关。"""
+    return canonical_json(
+        {
+            "key_id": key_id,
+            "timestamp": timestamp,
+            "nonce": nonce,
+            "payload": payload,
+        }
+    )
+
+
+def secure_error(status_code: int, code: str, message: str, **extra: object) -> JSONResponse:
+    """构造 /secure-request 的可定位错误响应。"""
+    content: dict[str, object] = {"error": code, "message": message}
+    content.update(extra)
+    return JSONResponse(status_code=status_code, content=content)
+
+
+def _invalid_envelope(message: str, *, field: str | None = None) -> JSONResponse:
+    extra = {"field": field} if field is not None else {}
+    return secure_error(401, "invalid_envelope", message, **extra)
+
+
+def _reject_json_constant(value: str):
+    """json.parse_constant 钩子：拒绝 NaN / Infinity / -Infinity。"""
+    raise ValueError(f"不支持的 JSON 常量 {value}")
+
+
+@app.post("/secure-request")
+async def secure_request(request: Request):
+    """带 HMAC-SHA256 验签与防重放的统一入口。
+
+    请求体：{"operation": "plan"|"assemble", "payload": {...},
+             "key_id": ..., "timestamp": <Unix 秒整数>,
+             "nonce": ..., "signature": "<小写十六进制 HMAC-SHA256>"}
+    验签通过后以 payload 调用对应操作，并原样返回 /plan 或 /assemble 的响应。
+    """
+
+    # 1. 解析信封（任何信封层问题都无法验签，统一 401）。
+    #    parse_constant 拒绝 NaN/Infinity 等非标准 JSON 常量：它们无法按
+    #    allow_nan=False 的固定规范化重新序列化，跨语言也不可互操作。
+    raw = await request.body()
+    try:
+        envelope = json.loads(
+            raw.decode("utf-8"), parse_constant=_reject_json_constant
+        )
+    except (UnicodeDecodeError, json.JSONDecodeError, ValueError):
+        return _invalid_envelope("请求体必须是 UTF-8 编码的合法 JSON 对象")
+    if not isinstance(envelope, dict):
+        return _invalid_envelope("请求体必须是 JSON 对象")
+
+    operation = envelope.get("operation")
+    if operation not in ("plan", "assemble"):
+        return _invalid_envelope(
+            "operation 必须是 'plan' 或 'assemble'", field="operation"
+        )
+
+    key_id = envelope.get("key_id")
+    if not isinstance(key_id, str) or not key_id:
+        return _invalid_envelope("key_id 必须是非空字符串", field="key_id")
+
+    timestamp = envelope.get("timestamp")
+    # bool 是 int 的子类，显式排除；只接受整数 Unix 秒
+    if isinstance(timestamp, bool) or not isinstance(timestamp, int):
+        return _invalid_envelope(
+            "timestamp 必须是整数 Unix 秒", field="timestamp"
+        )
+
+    nonce = envelope.get("nonce")
+    if not isinstance(nonce, str) or not nonce:
+        return _invalid_envelope("nonce 必须是非空字符串", field="nonce")
+    if len(nonce) > MAX_NONCE_LENGTH:
+        return _invalid_envelope(
+            f"nonce 长度不得超过 {MAX_NONCE_LENGTH} 个字符", field="nonce"
+        )
+
+    signature = envelope.get("signature")
+    if not isinstance(signature, str) or not signature:
+        return _invalid_envelope("signature 必须是非空十六进制字符串", field="signature")
+
+    if "payload" not in envelope:
+        return _invalid_envelope("缺少 payload 字段", field="payload")
+    payload = envelope["payload"]
+
+    # 2. 服务端必须配置了密钥。
+    if not SECURE_KEYS:
+        return secure_error(
+            503,
+            "keys_not_configured",
+            f"服务端未配置 HMAC 密钥：请通过 {SECURE_ENV_KEYS} 环境变量配置 "
+            f"key_id -> Base64 密钥的 JSON 对象"
+            + (f"（当前配置无效：{SECURE_KEYS_ERROR}）" if SECURE_KEYS_ERROR else ""),
+        )
+
+    # 3. key_id 必须是已知身份。
+    secret = SECURE_KEYS.get(key_id)
+    if secret is None:
+        return secure_error(
+            401, "unknown_key_id", f"未知 key_id：{key_id}", key_id=key_id
+        )
+
+    # 4. 时间戳偏差检查。
+    now = int(time.time())
+    skew = abs(now - timestamp)
+    if skew > TIMESTAMP_TOLERANCE:
+        return secure_error(
+            401,
+            "timestamp_expired",
+            f"时间戳超出容限：偏差 {skew} 秒 > {TIMESTAMP_TOLERANCE} 秒",
+            server_time=now,
+        )
+
+    # 5. 固定 JSON 规范化后用 HMAC-SHA256 验签（常量时间比较）。
+    #    验签先于 nonce 占用，避免签名错误的请求消耗掉合法 nonce。
+    signing_doc = build_signing_document(payload, key_id, timestamp, nonce)
+    expected = hmac.new(secret, signing_doc, hashlib.sha256).hexdigest()
+    if not hmac.compare_digest(expected, signature.lower()):
+        return secure_error(
+            401,
+            "invalid_signature",
+            "签名校验失败：请按固定 JSON 规范化对 "
+            "{key_id,timestamp,nonce,payload} 计算 HMAC-SHA256 小写十六进制摘要",
+        )
+
+    # 6. 重放检查（验签通过后登记：窗口内同一 key_id+nonce 只能成功一次；
+    #    占用先于操作执行，操作语义失败也不会让同一 nonce 再次进入业务）。
+    if not nonce_store.reserve(key_id, nonce, timestamp + TIMESTAMP_TOLERANCE):
+        return secure_error(
+            409,
+            "nonce_replayed",
+            f"key_id {key_id!r} 的 nonce {nonce!r} 在有效期内已使用过",
+            key_id=key_id,
+        )
+
+    # 7. 验签通过：payload 交给对应操作。信封层不复用，/plan、/assemble 不受影响。
+    try:
+        if operation == "plan":
+            req_model = PlanRequest.model_validate(payload)
+            result = (
+                plan_without_cache(req_model)
+                if not req_model.cached_blocks
+                else plan_with_cache(req_model)
+            )
+        else:
+            req_model = AssembleRequest.model_validate(payload)
+            result = assemble(req_model)
+    except ValidationError as exc:
+        return JSONResponse(
+            status_code=422,
+            content={
+                "error": "invalid_request",
+                "detail": jsonable_encoder(exc.errors(), custom_encoder={Exception: str}),
+            },
+        )
+    except PlanningError as exc:
+        return JSONResponse(
+            status_code=422,
+            content={
+                "error": "unsatisfiable",
+                "message": exc.message,
+                **(
+                    {"range_index": exc.range_index}
+                    if exc.range_index is not None
+                    else {}
+                ),
+            },
+        )
+    except AssemblyError as exc:
+        detail: dict[str, object] = {"message": exc.message}
+        if exc.loc is not None:
+            detail["loc"] = exc.loc
+        if exc.block_index is not None:
+            detail["block_index"] = exc.block_index
+        if exc.cache_id is not None:
+            detail["cache_id"] = exc.cache_id
+        if exc.range_index is not None:
+            detail["range_index"] = exc.range_index
+        if exc.slice_index is not None:
+            detail["slice_index"] = exc.slice_index
+        return JSONResponse(
+            status_code=422,
+            content={"error": exc.code, "detail": [detail]},
+        )
+
+    return JSONResponse(status_code=200, content=jsonable_encoder(result))

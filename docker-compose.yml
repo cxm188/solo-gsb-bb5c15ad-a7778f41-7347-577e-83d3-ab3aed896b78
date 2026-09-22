@@ -4,6 +4,13 @@ services:
     image: range-planner:latest
     ports:
       - "127.0.0.1:8080:8080"
+    environment:
+      # /secure-request 验签密钥表：JSON 对象，key 为 key_id，value 为
+      # 标准 Base64 编码的 HMAC-SHA256 密钥。此处为示例密钥，生产环境务必替换。
+      SECURE_REQUEST_KEYS: >-
+        {"demo": "ZGVtby1zZWNyZXQta2V5LWRvLW5vdC11c2UtaW4tcHJvZC0zMkIh"}
+      # 允许的请求时间戳与服务端时钟的最大偏差（秒），默认 300
+      SECURE_REQUEST_TIMESTAMP_TOLERANCE: "300"
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8080/healthz', timeout=2).status==200 else 1)"]
